@@ -4,10 +4,10 @@ import logging
 from datetime import datetime, timedelta
 import pytz
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes,
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, filters, ConversationHandler
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -19,11 +19,15 @@ logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ["BOT_TOKEN"]
-CHAT_ID     = os.environ["CHAT_ID"]        # your private chat ID (expenses/reports)
-CHANNEL_ID  = os.environ["CHANNEL_ID"]    # e.g. @yourchannel or -100xxxxxxxxxx
+CHAT_ID     = os.environ["CHAT_ID"]
+CHANNEL_ID  = os.environ["CHANNEL_ID"]
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 SGT         = pytz.timezone("Asia/Singapore")
 DATA_FILE   = "data.json"
+
+# ── Conversation states ────────────────────────────────────────────────────────
+WAITING_EXPENSE = 1
+WAITING_INCOME  = 2
 
 # ── Symbols ────────────────────────────────────────────────────────────────────
 US_SYMBOLS = {
@@ -36,12 +40,24 @@ SGX_SYMBOLS = {
     "U11.SI": "UOB",
     "Z74.SI": "SingTel",
 }
-# Macro context — shown as extra colour in the channel post
 MACRO_SYMBOLS = {
     "^TNX": "US 10Y Yield",
     "GC=F": "Gold",
     "CL=F": "Crude Oil (WTI)",
 }
+
+# ── Keyboards ──────────────────────────────────────────────────────────────────
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["📈 Market Snapshot",  "📊 Full Market Report"],
+        ["💸 Log Expense",      "💰 Log Income"],
+        ["📋 Weekly Report",    "📅 Monthly Report"],
+        ["🗂 Categories",       "📝 Recent Entries"],
+        ["🗑 Delete Last Entry", "ℹ️ Help"],
+    ],
+    resize_keyboard=True,
+    persistent=True
+)
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
 def load() -> dict:
@@ -56,10 +72,7 @@ def save(data: dict):
 
 # ── Market helpers ─────────────────────────────────────────────────────────────
 def fetch_quote(symbol: str) -> dict | None:
-    url = (
-        f"https://financialmodelingprep.com/api/v3/quote/{symbol}"
-        f"?apikey={FMP_API_KEY}"
-    )
+    url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
     try:
         r = requests.get(url, timeout=10)
         data = r.json()
@@ -68,14 +81,21 @@ def fetch_quote(symbol: str) -> dict | None:
         logger.error(f"Quote error {symbol}: {e}")
         return None
 
+def fmt_chg(chg: float) -> str:
+    sign = "+" if chg >= 0 else ""
+    return f"{sign}{chg:.2f}%"
+
+def momentum_bar(chg: float) -> str:
+    filled = min(int(abs(chg) / 0.5), 5)
+    empty  = 5 - filled
+    return ("▓" * filled + "░" * empty) if chg >= 0 else ("░" * empty + "▓" * filled)
+
 def sentiment_label(changes: list) -> tuple:
-    """Return (emoji, label) based on list of % changes."""
     if not changes:
         return "➡️", "No Data"
     avg      = sum(changes) / len(changes)
     positives = sum(1 for c in changes if c > 0)
     ratio    = positives / len(changes)
-
     if avg >= 1.0 and ratio >= 0.7:
         return "🚀", "Strongly Bullish"
     elif avg >= 0.2 and ratio >= 0.5:
@@ -87,27 +107,37 @@ def sentiment_label(changes: list) -> tuple:
     else:
         return "➡️", "Mixed / Neutral"
 
-def momentum_bar(chg: float) -> str:
-    """5-block ASCII bar showing magnitude of move."""
-    filled = min(int(abs(chg) / 0.5), 5)
-    empty  = 5 - filled
-    return ("▓" * filled + "░" * empty) if chg >= 0 else ("░" * empty + "▓" * filled)
+def build_quick_snapshot() -> str:
+    now = datetime.now(SGT).strftime("%a, %d %b %Y %H:%M SGT")
+    lines = [f"📈 *Market Snapshot*\n_{now}_\n"]
+    lines.append("🇺🇸 *US Markets*")
+    for sym, name in US_SYMBOLS.items():
+        q = fetch_quote(sym)
+        if q:
+            chg = q.get("changesPercentage", 0)
+            arrow = "🟢" if chg >= 0 else "🔴"
+            lines.append(f"{arrow} {name}: `{q['price']:,.2f}` ({fmt_chg(chg)})")
+        else:
+            lines.append(f"⚠️ {name}: unavailable")
+    lines.append("\n🇸🇬 *SGX*")
+    for sym, name in SGX_SYMBOLS.items():
+        q = fetch_quote(sym)
+        if q:
+            chg = q.get("changesPercentage", 0)
+            arrow = "🟢" if chg >= 0 else "🔴"
+            lines.append(f"{arrow} {name}: `SGD {q['price']:.3f}` ({fmt_chg(chg)})")
+        else:
+            lines.append(f"⚠️ {name}: unavailable")
+    return "\n".join(lines)
 
-def fmt_chg(chg: float) -> str:
-    sign = "+" if chg >= 0 else ""
-    return f"{sign}{chg:.2f}%"
-
-# ── Channel post builder ───────────────────────────────────────────────────────
 def build_channel_post() -> str:
     now  = datetime.now(SGT)
     date = now.strftime("%A, %d %b %Y")
     time = now.strftime("%H:%M SGT")
-
     lines = []
     lines.append("📊 *Daily Market Update*")
     lines.append(f"_{date} · {time}_\n")
 
-    # US Markets
     lines.append("🇺🇸 *US MARKETS*")
     lines.append("```")
     lines.append(f"{'Index':<14} {'Price':>10}  {'Chg':>8}  Momentum")
@@ -118,9 +148,7 @@ def build_channel_post() -> str:
         if q:
             chg = q.get("changesPercentage", 0)
             us_changes.append(chg)
-            lines.append(
-                f"{name:<14} {q['price']:>10,.2f}  {fmt_chg(chg):>8}  {momentum_bar(chg)}"
-            )
+            lines.append(f"{name:<14} {q['price']:>10,.2f}  {fmt_chg(chg):>8}  {momentum_bar(chg)}")
         else:
             lines.append(f"{name:<14} {'—':>10}  {'n/a':>8}")
     lines.append("```")
@@ -128,7 +156,6 @@ def build_channel_post() -> str:
         emoji, label = sentiment_label(us_changes)
         lines.append(f"Sentiment: {emoji} *{label}*\n")
 
-    # SGX Stocks
     lines.append("🇸🇬 *SGX STOCKS*")
     lines.append("```")
     lines.append(f"{'Stock':<14} {'Price':>10}  {'Chg':>8}  Momentum")
@@ -139,9 +166,7 @@ def build_channel_post() -> str:
         if q:
             chg = q.get("changesPercentage", 0)
             sgx_changes.append(chg)
-            lines.append(
-                f"{name:<14} SGD {q['price']:>6.3f}  {fmt_chg(chg):>8}  {momentum_bar(chg)}"
-            )
+            lines.append(f"{name:<14} SGD {q['price']:>6.3f}  {fmt_chg(chg):>8}  {momentum_bar(chg)}")
         else:
             lines.append(f"{name:<14} {'—':>10}  {'n/a':>8}")
     lines.append("```")
@@ -149,7 +174,6 @@ def build_channel_post() -> str:
         emoji, label = sentiment_label(sgx_changes)
         lines.append(f"Sentiment: {emoji} *{label}*\n")
 
-    # Macro Context
     lines.append("🌐 *MACRO CONTEXT*")
     lines.append("```")
     lines.append(f"{'Asset':<22} {'Price':>8}  {'Chg':>8}")
@@ -157,15 +181,13 @@ def build_channel_post() -> str:
     for sym, name in MACRO_SYMBOLS.items():
         q = fetch_quote(sym)
         if q:
-            chg   = q.get("changesPercentage", 0)
-            price = q["price"]
-            unit  = "%" if "Yield" in name else ""
-            lines.append(f"{name:<22} {price:>8.2f}{unit}  {fmt_chg(chg):>8}")
+            chg  = q.get("changesPercentage", 0)
+            unit = "%" if "Yield" in name else ""
+            lines.append(f"{name:<22} {q['price']:>8.2f}{unit}  {fmt_chg(chg):>8}")
         else:
             lines.append(f"{name:<22} {'—':>8}  {'n/a':>8}")
     lines.append("```")
 
-    # Overall sentiment
     all_changes = us_changes + sgx_changes
     if all_changes:
         emoji, label = sentiment_label(all_changes)
@@ -188,127 +210,14 @@ def build_channel_post() -> str:
     lines.append(f"\n_Data: Financial Modeling Prep · {time}_")
     return "\n".join(lines)
 
-# ── Quick snapshot (private chat /market) ─────────────────────────────────────
-def build_quick_snapshot() -> str:
-    now = datetime.now(SGT).strftime("%a, %d %b %Y %H:%M SGT")
-    lines = [f"📊 *Market Snapshot* — {now}\n"]
-    lines.append("🇺🇸 *US Markets*")
-    for sym, name in US_SYMBOLS.items():
-        q = fetch_quote(sym)
-        if q:
-            chg   = q.get("changesPercentage", 0)
-            arrow = "🟢" if chg >= 0 else "🔴"
-            lines.append(f"{arrow} {name}: `{q['price']:,.2f}` ({fmt_chg(chg)})")
-        else:
-            lines.append(f"⚠️ {name}: unavailable")
-    lines.append("\n🇸🇬 *SGX*")
-    for sym, name in SGX_SYMBOLS.items():
-        q = fetch_quote(sym)
-        if q:
-            chg   = q.get("changesPercentage", 0)
-            arrow = "🟢" if chg >= 0 else "🔴"
-            lines.append(f"{arrow} {name}: `SGD {q['price']:.3f}` ({fmt_chg(chg)})")
-        else:
-            lines.append(f"⚠️ {name}: unavailable")
-    return "\n".join(lines)
-
-# ── Commands ───────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👋 *Finance & Market Bot*\n\n"
-        "*Expenses*\n"
-        "`/expense <amount> <category> [note]`\n"
-        "e.g. `/expense 45.50 food Lunch at PS`\n\n"
-        "*Income*\n"
-        "`/income <amount> <type> [note]`\n"
-        "e.g. `/income 800 commission AIA client`\n\n"
-        "*Reports*\n"
-        "`/report` — this week's summary\n"
-        "`/report month` — this month's summary\n\n"
-        "*Market*\n"
-        "`/market` — quick snapshot\n"
-        "`/marketfull` — full channel-style post with sentiment\n\n"
-        "*Manage*\n"
-        "`/list` — recent entries\n"
-        "`/delete` — remove last entry\n"
-        "`/categories` — expense breakdown"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def cmd_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Usage: `/expense <amount> <category> [note]`",
-            parse_mode="Markdown"
-        )
-        return
-    try:
-        amount = float(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Amount must be a number.")
-        return
-    category = args[1].lower()
-    note = " ".join(args[2:]) if len(args) > 2 else ""
-    data = load()
-    data["expenses"].append({
-        "type": "expense", "amount": amount,
-        "category": category, "note": note,
-        "date": datetime.now(SGT).isoformat()
-    })
-    save(data)
-    await update.message.reply_text(
-        f"✅ Expense logged\n💸 SGD {amount:.2f} — *{category}*"
-        f"{f' ({note})' if note else ''}",
-        parse_mode="Markdown"
-    )
-
-async def cmd_income(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Usage: `/income <amount> <type> [note]`",
-            parse_mode="Markdown"
-        )
-        return
-    try:
-        amount = float(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Amount must be a number.")
-        return
-    income_type = args[1].lower()
-    note = " ".join(args[2:]) if len(args) > 2 else ""
-    data = load()
-    data["income"].append({
-        "type": "income", "amount": amount,
-        "income_type": income_type, "note": note,
-        "date": datetime.now(SGT).isoformat()
-    })
-    save(data)
-    await update.message.reply_text(
-        f"✅ Income logged\n💰 SGD {amount:.2f} — *{income_type}*"
-        f"{f' ({note})' if note else ''}",
-        parse_mode="Markdown"
-    )
-
-async def cmd_market(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Fetching...")
-    await update.message.reply_text(build_quick_snapshot(), parse_mode="Markdown")
-
-async def cmd_marketfull(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Building full market report...")
-    await update.message.reply_text(build_channel_post(), parse_mode="Markdown")
-
-async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    period = ctx.args[0].lower() if ctx.args else "week"
+# ── Report builders ────────────────────────────────────────────────────────────
+def build_report(period: str) -> str:
     now = datetime.now(SGT)
     if period == "month":
         start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         label = now.strftime("%B %Y")
     else:
-        start = (now - timedelta(days=now.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
         label = f"Week of {start.strftime('%d %b')}"
 
     data = load()
@@ -345,115 +254,272 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append(f"\n{net_emoji} *Net: SGD {net:+,.2f}*")
     if not expenses and not incomes:
         lines.append("\n_No entries found for this period._")
+    return "\n".join(lines)
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load()
-    all_entries = sorted(
-        data["expenses"] + data["income"],
-        key=lambda x: x["date"], reverse=True
-    )[:10]
-    if not all_entries:
-        await update.message.reply_text("No entries yet.")
-        return
-    lines = ["📝 *Last 10 entries*\n```"]
-    lines.append(f"{'Date':<8} {'Type':<11} {'SGD':>8}")
-    lines.append("─" * 30)
-    for e in all_entries:
-        dt   = datetime.fromisoformat(e["date"]).strftime("%d/%m")
-        kind = e.get("category") or e.get("income_type") or "—"
-        amt  = e["amount"]
-        sign = "-" if "category" in e else "+"
-        lines.append(f"{dt:<8} {kind[:11]:<11} {sign}{amt:>7,.2f}")
-    lines.append("```")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load()
-    all_entries = sorted(
-        [(i, e, "expenses") for i, e in enumerate(data["expenses"])] +
-        [(i, e, "income")   for i, e in enumerate(data["income"])],
-        key=lambda x: x[1]["date"], reverse=True
-    )
-    if not all_entries:
-        await update.message.reply_text("Nothing to delete.")
-        return
-    idx, entry, source = all_entries[0]
-    dt   = datetime.fromisoformat(entry["date"]).strftime("%d %b %H:%M")
-    kind = entry.get("category") or entry.get("income_type")
-    amt  = entry["amount"]
-    keyboard = [[
-        InlineKeyboardButton("✅ Yes, delete", callback_data=f"del:{source}:{idx}"),
-        InlineKeyboardButton("❌ Cancel",       callback_data="del:cancel")
-    ]]
+# ── Handlers ───────────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"Delete last entry?\n💸 SGD {amt:.2f} — *{kind}* on {dt}",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+        "👋 *Welcome to Mich's Finance Bot!*\n\n"
+        "Track your expenses, income, and get daily market updates.\n\n"
+        "Use the buttons below to get started 👇",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD
     )
 
-async def cmd_categories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data  = load()
-    now   = datetime.now(SGT)
-    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    expenses = [e for e in data["expenses"] if datetime.fromisoformat(e["date"]) >= start]
-    total    = sum(e["amount"] for e in expenses)
-    cat_totals: dict = {}
-    for e in expenses:
-        cat_totals[e["category"]] = cat_totals.get(e["category"], 0) + e["amount"]
-    if not cat_totals:
-        await update.message.reply_text("No expenses this month yet.")
-        return
-    lines = [f"📊 *Expense Categories — {now.strftime('%B')}*\n```"]
-    lines.append(f"{'Category':<18} {'SGD':>8}  {'%':>5}")
-    lines.append("─" * 34)
-    for k, v in sorted(cat_totals.items(), key=lambda x: -x[1]):
-        pct = v / total * 100
-        bar = "█" * int(pct / 5)
-        lines.append(f"{k.capitalize():<18} {v:>8,.2f}  {pct:>4.0f}% {bar}")
-    lines.append("─" * 34)
-    lines.append(f"{'TOTAL':<18} {total:>8,.2f}\n```")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+async def show_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ *How to use this bot*\n\n"
+        "📈 *Market Snapshot* — quick SGX + US prices\n"
+        "📊 *Full Market Report* — detailed post with sentiment\n\n"
+        "💸 *Log Expense* — tap and follow the prompt\n"
+        "💰 *Log Income* — tap and follow the prompt\n\n"
+        "📋 *Weekly Report* — this week's income vs expenses\n"
+        "📅 *Monthly Report* — this month's breakdown\n\n"
+        "🗂 *Categories* — monthly spend by category\n"
+        "📝 *Recent Entries* — last 10 transactions\n"
+        "🗑 *Delete Last Entry* — removes most recent entry\n\n"
+        "_Channel gets daily market updates Mon–Sat at 9 AM SGT_ 📡",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD
+    )
 
-# ── Callbacks ──────────────────────────────────────────────────────────────────
-async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split(":")
-    if parts[0] == "del":
-        if parts[1] == "cancel":
-            await query.edit_message_text("❌ Cancelled.")
-            return
-        source, idx = parts[1], int(parts[2])
-        data = load()
-        removed = data[source].pop(idx)
-        save(data)
-        kind = removed.get("category") or removed.get("income_type")
-        await query.edit_message_text(
-            f"🗑 Deleted: SGD {removed['amount']:.2f} — {kind}"
+# ── Expense conversation ───────────────────────────────────────────────────────
+async def expense_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💸 *Log Expense*\n\n"
+        "Send me the details in this format:\n"
+        "`amount category note`\n\n"
+        "Examples:\n"
+        "`45.50 food Chicken rice at Maxwell`\n"
+        "`120 transport Grab to airport`\n"
+        "`89.90 shopping NTUC groceries`\n\n"
+        "_Type /cancel to go back_",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return WAITING_EXPENSE
+
+async def expense_receive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "/cancel":
+        await update.message.reply_text("❌ Cancelled.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+    parts = text.split(None, 2)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "⚠️ Please send: `amount category note`\ne.g. `45.50 food Lunch`",
+            parse_mode="Markdown"
         )
+        return WAITING_EXPENSE
+    try:
+        amount = float(parts[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ First value must be a number. Try again:")
+        return WAITING_EXPENSE
+    category = parts[1].lower()
+    note     = parts[2] if len(parts) > 2 else ""
+    data = load()
+    data["expenses"].append({
+        "type": "expense", "amount": amount,
+        "category": category, "note": note,
+        "date": datetime.now(SGT).isoformat()
+    })
+    save(data)
+    await update.message.reply_text(
+        f"✅ *Expense logged!*\n\n"
+        f"💸 SGD {amount:.2f}\n"
+        f"🏷 Category: *{category.capitalize()}*"
+        f"{f'{chr(10)}📝 Note: {note}' if note else ''}",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD
+    )
+    return ConversationHandler.END
+
+# ── Income conversation ────────────────────────────────────────────────────────
+async def income_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💰 *Log Income*\n\n"
+        "Send me the details in this format:\n"
+        "`amount type note`\n\n"
+        "Examples:\n"
+        "`3200 salary March salary`\n"
+        "`800 commission AIA policy — client name`\n"
+        "`500 bonus performance bonus`\n\n"
+        "_Type /cancel to go back_",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return WAITING_INCOME
+
+async def income_receive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "/cancel":
+        await update.message.reply_text("❌ Cancelled.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+    parts = text.split(None, 2)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "⚠️ Please send: `amount type note`\ne.g. `800 commission AIA policy`",
+            parse_mode="Markdown"
+        )
+        return WAITING_INCOME
+    try:
+        amount = float(parts[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ First value must be a number. Try again:")
+        return WAITING_INCOME
+    income_type = parts[1].lower()
+    note        = parts[2] if len(parts) > 2 else ""
+    data = load()
+    data["income"].append({
+        "type": "income", "amount": amount,
+        "income_type": income_type, "note": note,
+        "date": datetime.now(SGT).isoformat()
+    })
+    save(data)
+    await update.message.reply_text(
+        f"✅ *Income logged!*\n\n"
+        f"💰 SGD {amount:.2f}\n"
+        f"🏷 Type: *{income_type.capitalize()}*"
+        f"{f'{chr(10)}📝 Note: {note}' if note else ''}",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD
+    )
+    return ConversationHandler.END
+
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Cancelled.", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+# ── Button handler ─────────────────────────────────────────────────────────────
+async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+
+    if text == "📈 Market Snapshot":
+        await update.message.reply_text("⏳ Fetching market data...", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(build_quick_snapshot(), parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+    elif text == "📊 Full Market Report":
+        await update.message.reply_text("⏳ Building full report...", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(build_channel_post(), parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+    elif text == "📋 Weekly Report":
+        await update.message.reply_text(build_report("week"), parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+    elif text == "📅 Monthly Report":
+        await update.message.reply_text(build_report("month"), parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+    elif text == "🗂 Categories":
+        data  = load()
+        now   = datetime.now(SGT)
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        expenses = [e for e in data["expenses"] if datetime.fromisoformat(e["date"]) >= start]
+        total    = sum(e["amount"] for e in expenses)
+        cat_totals: dict = {}
+        for e in expenses:
+            cat_totals[e["category"]] = cat_totals.get(e["category"], 0) + e["amount"]
+        if not cat_totals:
+            await update.message.reply_text("No expenses this month yet.", reply_markup=MAIN_KEYBOARD)
+            return
+        lines = [f"🗂 *Expense Categories — {now.strftime('%B')}*\n```"]
+        lines.append(f"{'Category':<18} {'SGD':>8}  {'%':>5}")
+        lines.append("─" * 34)
+        for k, v in sorted(cat_totals.items(), key=lambda x: -x[1]):
+            pct = v / total * 100
+            bar = "█" * int(pct / 5)
+            lines.append(f"{k.capitalize():<18} {v:>8,.2f}  {pct:>4.0f}% {bar}")
+        lines.append("─" * 34)
+        lines.append(f"{'TOTAL':<18} {total:>8,.2f}\n```")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+    elif text == "📝 Recent Entries":
+        data = load()
+        all_entries = sorted(
+            data["expenses"] + data["income"],
+            key=lambda x: x["date"], reverse=True
+        )[:10]
+        if not all_entries:
+            await update.message.reply_text("No entries yet.", reply_markup=MAIN_KEYBOARD)
+            return
+        lines = ["📝 *Last 10 entries*\n```"]
+        lines.append(f"{'Date':<8} {'Type':<11} {'SGD':>8}")
+        lines.append("─" * 30)
+        for e in all_entries:
+            dt   = datetime.fromisoformat(e["date"]).strftime("%d/%m")
+            kind = e.get("category") or e.get("income_type") or "—"
+            amt  = e["amount"]
+            sign = "-" if "category" in e else "+"
+            lines.append(f"{dt:<8} {kind[:11]:<11} {sign}{amt:>7,.2f}")
+        lines.append("```")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+    elif text == "🗑 Delete Last Entry":
+        data = load()
+        all_entries = sorted(
+            [(i, e, "expenses") for i, e in enumerate(data["expenses"])] +
+            [(i, e, "income")   for i, e in enumerate(data["income"])],
+            key=lambda x: x[1]["date"], reverse=True
+        )
+        if not all_entries:
+            await update.message.reply_text("Nothing to delete.", reply_markup=MAIN_KEYBOARD)
+            return
+        idx, entry, source = all_entries[0]
+        kind = entry.get("category") or entry.get("income_type")
+        amt  = entry["amount"]
+        dt   = datetime.fromisoformat(entry["date"]).strftime("%d %b %H:%M")
+        # Store pending delete in user context
+        ctx.user_data["pending_delete"] = {"source": source, "idx": idx}
+        confirm_kb = ReplyKeyboardMarkup(
+            [["✅ Yes, delete it", "❌ Cancel"]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+        await update.message.reply_text(
+            f"🗑 Delete this entry?\n\n"
+            f"💸 SGD {amt:.2f} — *{kind}*\n"
+            f"📅 {dt}",
+            parse_mode="Markdown",
+            reply_markup=confirm_kb
+        )
+
+    elif text == "✅ Yes, delete it":
+        pending = ctx.user_data.get("pending_delete")
+        if pending:
+            data = load()
+            removed = data[pending["source"]].pop(pending["idx"])
+            save(data)
+            kind = removed.get("category") or removed.get("income_type")
+            await update.message.reply_text(
+                f"🗑 Deleted: SGD {removed['amount']:.2f} — {kind}",
+                reply_markup=MAIN_KEYBOARD
+            )
+            ctx.user_data.pop("pending_delete", None)
+        else:
+            await update.message.reply_text("Nothing to delete.", reply_markup=MAIN_KEYBOARD)
+
+    elif text == "❌ Cancel":
+        ctx.user_data.pop("pending_delete", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=MAIN_KEYBOARD)
+
+    elif text == "ℹ️ Help":
+        await show_help(update, ctx)
 
 # ── Scheduled jobs ─────────────────────────────────────────────────────────────
 async def scheduled_channel_update(app):
-    """Mon–Sat 9:00 AM SGT → full market post to channel."""
     now = datetime.now(SGT)
-    if now.weekday() == 6:   # skip Sunday only
+    if now.weekday() == 6:
         return
     logger.info("Posting daily market update to channel...")
     try:
-        post = build_channel_post()
         await app.bot.send_message(
             chat_id=CHANNEL_ID,
-            text=post,
+            text=build_channel_post(),
             parse_mode="Markdown"
         )
-        logger.info("Channel post sent successfully.")
+        logger.info("Channel post sent.")
     except Exception as e:
         logger.error(f"Channel post failed: {e}")
 
 async def scheduled_weekly_report(app):
-    """Every Monday 9:05 AM SGT → weekly financial report to private chat."""
     now   = datetime.now(SGT)
     start = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
     label = f"{start.strftime('%d %b')} – {(now - timedelta(days=1)).strftime('%d %b %Y')}"
@@ -499,34 +565,32 @@ async def scheduled_weekly_report(app):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("help",        cmd_start))
-    app.add_handler(CommandHandler("expense",     cmd_expense))
-    app.add_handler(CommandHandler("income",      cmd_income))
-    app.add_handler(CommandHandler("market",      cmd_market))
-    app.add_handler(CommandHandler("marketfull",  cmd_marketfull))
-    app.add_handler(CommandHandler("report",      cmd_report))
-    app.add_handler(CommandHandler("list",        cmd_list))
-    app.add_handler(CommandHandler("delete",      cmd_delete))
-    app.add_handler(CommandHandler("categories",  cmd_categories))
-    app.add_handler(CallbackQueryHandler(callback_handler))
+    # Expense conversation
+    expense_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^💸 Log Expense$"), expense_start)],
+        states={WAITING_EXPENSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receive)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # Income conversation
+    income_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^💰 Log Income$"), income_start)],
+        states={WAITING_INCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, income_receive)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help",  cmd_start))
+    app.add_handler(expense_conv)
+    app.add_handler(income_conv)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, button_handler))
 
     scheduler = AsyncIOScheduler(timezone=SGT)
-    # Mon–Sat 9:00 AM SGT — channel market post
-    scheduler.add_job(
-        scheduled_channel_update, "cron",
-        day_of_week="mon-sat", hour=9, minute=0,
-        args=[app]
-    )
-    # Every Monday 9:05 AM SGT — private weekly financial report
-    scheduler.add_job(
-        scheduled_weekly_report, "cron",
-        day_of_week="mon", hour=9, minute=5,
-        args=[app]
-    )
+    scheduler.add_job(scheduled_channel_update, "cron", day_of_week="mon-sat", hour=9, minute=0,  args=[app])
+    scheduler.add_job(scheduled_weekly_report,  "cron", day_of_week="mon",     hour=9, minute=5,  args=[app])
     scheduler.start()
 
-    logger.info("Bot started — channel updates Mon–Sat 9:00 AM SGT.")
+    logger.info("Bot started with reply keyboard.")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
